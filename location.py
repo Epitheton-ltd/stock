@@ -4,6 +4,7 @@ import datetime
 import operator
 from decimal import Decimal
 
+from trytond.i18n import gettext
 from trytond.model import (
     ModelView, ModelSQL, MatchMixin, ValueMixin, DeactivableMixin, fields,
     sequence_ordered, tree)
@@ -13,6 +14,8 @@ from trytond.transaction import Transaction
 from trytond.pool import Pool, PoolMeta
 from trytond.tools import grouped_slice
 from trytond.tools.multivalue import migrate_property
+
+from .exceptions import LocationValidationError
 
 __all__ = ['Location', 'Party', 'PartyLocation', 'ProductsByLocationsContext',
     'LocationLeadTime']
@@ -29,7 +32,8 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
     name = fields.Char("Name", size=None, required=True, states=STATES,
         depends=DEPENDS, translate=True)
     code = fields.Char("Code", size=None, states=STATES, depends=DEPENDS,
-        select=True)
+        select=True,
+        help="The internal identifier used for the location.")
     address = fields.Many2One("party.address", "Address",
         states={
             'invisible': Eval('type') != 'warehouse',
@@ -46,18 +50,22 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
         ('drop', 'Drop'),
         ('view', 'View'),
         ], 'Location type', states=STATES, depends=DEPENDS)
+    type_string = type.translated('type')
     parent = fields.Many2One("stock.location", "Parent", select=True,
         left="left", right="right",
         states={
             'invisible': Eval('type') == 'warehouse',
             },
-        depends=['type'])
+        depends=['type'],
+        help="Used to add structure above the location.")
     left = fields.Integer('Left', required=True, select=True)
     right = fields.Integer('Right', required=True, select=True)
-    childs = fields.One2Many("stock.location", "parent", "Children")
+    childs = fields.One2Many("stock.location", "parent", "Children",
+        help="Used to add structure below the location.")
     flat_childs = fields.Boolean(
         "Flat Children",
-        help="Check to restrict to one level of children.")
+        help="Check to enforce a single level of children with no "
+        "grandchildren.")
     warehouse = fields.Function(fields.Many2One('stock.location', 'Warehouse'),
         'get_warehouse')
     input_location = fields.Many2One(
@@ -73,7 +81,8 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
                 ('parent', '=', None),
                 ],
             ],
-        depends=['type', 'active', 'id'])
+        depends=['type', 'active', 'id'],
+        help="Where incoming stock is received.")
     output_location = fields.Many2One(
         "stock.location", "Output", states={
             'invisible': Eval('type') != 'warehouse',
@@ -85,7 +94,8 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
             ['OR',
                 ('parent', 'child_of', [Eval('id')]),
                 ('parent', '=', None)]],
-        depends=['type', 'active', 'id'])
+        depends=['type', 'active', 'id'],
+        help="Where outgoing stock is sent from.")
     storage_location = fields.Many2One(
         "stock.location", "Storage", states={
             'invisible': Eval('type') != 'warehouse',
@@ -97,7 +107,8 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
             ['OR',
                 ('parent', 'child_of', [Eval('id')]),
                 ('parent', '=', None)]],
-        depends=['type', 'active', 'id'])
+        depends=['type', 'active', 'id'],
+        help="The top level location where stock is stored.")
     picking_location = fields.Many2One(
         'stock.location', 'Picking', states={
             'invisible': Eval('type') != 'warehouse',
@@ -108,29 +119,24 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
             ('parent', 'child_of', [Eval('storage_location', -1)]),
             ],
         depends=['type', 'active', 'storage_location'],
-        help='If empty the Storage is used')
+        help="Where stock is picked from.\n"
+        "Leave empty to use the storage location.")
     quantity = fields.Function(
-        fields.Float('Quantity'), 'get_quantity', searcher='search_quantity')
+        fields.Float('Quantity',
+        help="The amount of stock in the location."),
+        'get_quantity', searcher='search_quantity')
     forecast_quantity = fields.Function(
-        fields.Float('Forecast Quantity'), 'get_quantity',
-        searcher='search_quantity')
-    cost_value = fields.Function(fields.Numeric('Cost Value'),
+        fields.Float('Forecast Quantity',
+        help="The amount of stock expected to be in the location."),
+        'get_quantity', searcher='search_quantity')
+    cost_value = fields.Function(fields.Numeric('Cost Value',
+        help="The value of the stock in the location."),
         'get_cost_value')
 
     @classmethod
     def __setup__(cls):
         super(Location, cls).__setup__()
         cls._order.insert(0, ('name', 'ASC'))
-        cls._error_messages.update({
-                'invalid_type_for_moves': ('Location "%s" with existing moves '
-                    'cannot be changed to a type that does not support moves.'
-                    ),
-                'child_of_warehouse': ('Location "%(location)s" must be a '
-                    'child of warehouse "%(warehouse)s".'),
-                'inactive_location_with_moves': (
-                    "The location '%(location)s' must be empty "
-                    "to be deactivated."),
-                })
 
         parent_domain = [
             ['OR',
@@ -208,8 +214,10 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
                         ('state', 'not in', ['staging', 'draft']),
                         ])
             if moves:
-                self.raise_user_error(
-                    'invalid_type_for_moves', (self.rec_name,))
+                raise LocationValidationError(
+                    gettext('stock.msg_location_invalid_type_for_moves',
+                        location=self.rec_name,
+                        type=self.type_string))
 
     @classmethod
     def check_inactive(cls, locations):
@@ -218,9 +226,9 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
         empty = cls.get_empty_locations(locations)
         non_empty = set(locations) - set(empty)
         if non_empty:
-            cls.raise_user_error('inactive_location_with_moves', {
-                    'location': next(iter(non_empty)).rec_name,
-                    })
+            raise LocationValidationError(
+                gettext('stock.msg_location_inactive_not_empty',
+                    location=next(iter(non_empty)).rec_name))
 
     @classmethod
     def get_empty_locations(cls, locations=None):
@@ -289,12 +297,14 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
 
     @classmethod
     def search_rec_name(cls, name, clause):
-        locations = cls.search([
-                ('code', '=', clause[2]),
-                ], order=[])
-        if locations:
-            return [('id', 'in', [l.id for l in locations])]
-        return [(cls._rec_name,) + tuple(clause[1:])]
+        if clause[1].startswith('!') or clause[1].startswith('not '):
+            bool_op = 'AND'
+        else:
+            bool_op = 'OR'
+        return [bool_op,
+            (cls._rec_name,) + tuple(clause[1:]),
+            ('code',) + tuple(clause[1:]),
+            ]
 
     @classmethod
     def get_quantity(cls, locations, name):
@@ -454,10 +464,10 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
                             ('parent', 'child_of', warehouse.id),
                             ]))
                 if location not in childs:
-                    cls.raise_user_error('child_of_warehouse', {
-                            'location': location.rec_name,
-                            'warehouse': warehouse.rec_name,
-                            })
+                    raise LocationValidationError(
+                        gettext('stock.msg_location_child_of_warehouse',
+                            location=location.rec_name,
+                            warehouse=warehouse.rec_name))
 
     @classmethod
     def copy(cls, locations, default=None):
@@ -512,11 +522,10 @@ class Location(DeactivableMixin, tree(), ModelSQL, ModelView):
 
 supplier_location = fields.Many2One(
     'stock.location', "Supplier Location", domain=[('type', '=', 'supplier')],
-    help='The default source location when receiving products from the party.')
+    help="The default source location for stock received from the party.")
 customer_location = fields.Many2One(
     'stock.location', "Customer Location", domain=[('type', '=', 'customer')],
-    help='The default destination location when sending products to the party.'
-    )
+    help="The default destination location for stock sent to the party.")
 
 
 class Party(metaclass=PoolMeta):
@@ -593,10 +602,10 @@ class ProductsByLocationsContext(ModelView):
     'Products by Locations'
     __name__ = 'stock.products_by_locations.context'
     forecast_date = fields.Date(
-        'At Date', help=('Allow to compute expected '
-            'stock quantities for this date.\n'
-            '* An empty value is an infinite date in the future.\n'
-            '* A date in the past will provide historical values.'))
+        'At Date',
+        help="The date for which the stock quantity is calculated.\n"
+        "* An empty value calculates as far ahead as possible.\n"
+        "* A date in the past will provide historical values.")
     stock_date_end = fields.Function(fields.Date('At Date'),
         'on_change_with_stock_date_end')
 
@@ -626,7 +635,8 @@ class LocationLeadTime(sequence_ordered(), ModelSQL, ModelView, MatchMixin):
         domain=[
             ('type', '=', 'warehouse'),
             ])
-    lead_time = fields.TimeDelta('Lead Time')
+    lead_time = fields.TimeDelta('Lead Time',
+        help="The time it takes to move stock between the warehouses.")
 
     @classmethod
     def get_lead_time(cls, pattern):

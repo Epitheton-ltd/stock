@@ -10,7 +10,9 @@ from sql.aggregate import Max
 from sql.functions import CurrentTimestamp
 from sql.conditionals import Coalesce
 
+from trytond.i18n import gettext
 from trytond.model import ModelSQL, ModelView, fields
+from trytond.model.exceptions import AccessError
 from trytond.wizard import Wizard, StateTransition
 from trytond.pyson import Eval, Or
 from trytond.transaction import Transaction
@@ -41,7 +43,7 @@ def check_no_move(func):
                     ],
                 limit=1, order=[])
             if moves:
-                return True
+                return moves
         return False
 
     @functools.wraps(func)
@@ -53,10 +55,10 @@ def check_no_move(func):
                 and transaction.context.get('_check_access')):
             actions = iter(args)
             for records, values in zip(actions, actions):
-                for field, error in Template._modify_no_move:
+                for field, msg in Template._modify_no_move:
                     if field in values:
                         if find_moves(cls, records):
-                            Template.raise_user_error(error)
+                            raise AccessError(gettext(msg))
                         # No moves for those records
                         break
         func(cls, *args)
@@ -65,10 +67,14 @@ def check_no_move(func):
 
 class Template(metaclass=PoolMeta):
     __name__ = "product.template"
-    quantity = fields.Function(fields.Float('Quantity'), 'sum_product')
-    forecast_quantity = fields.Function(fields.Float('Forecast Quantity'),
-            'sum_product')
-    cost_value = fields.Function(fields.Numeric('Cost Value'),
+    quantity = fields.Function(fields.Float('Quantity',
+        help="The amount of stock in the location."),
+        'sum_product')
+    forecast_quantity = fields.Function(fields.Float('Forecast Quantity',
+        help="The amount of stock expected to be in the location."),
+        'sum_product')
+    cost_value = fields.Function(fields.Numeric('Cost Value',
+        help="The value of the stock in the location."),
         'sum_product')
 
     def sum_product(self, name):
@@ -82,19 +88,13 @@ class Template(metaclass=PoolMeta):
     @classmethod
     def __setup__(cls):
         super(Template, cls).__setup__()
-        cls._error_messages.update({
-                'change_default_uom': ('You cannot change the default uom for '
-                    'a product which is associated to stock moves.'),
-                'change_type': ('You cannot change the type for a product '
-                    'which is associated to stock moves.'),
-                })
         cls.cost_price.states['required'] = Or(
             cls.cost_price.states.get('required', True),
             Eval('type').in_(['goods', 'assets']))
         cls.cost_price.depends.append('type')
         cls._modify_no_move = [
-            ('default_uom', 'change_default_uom'),
-            ('type', 'change_type'),
+            ('default_uom', 'stock.msg_product_change_default_uom'),
+            ('type', 'stock.msg_product_change_type'),
             ]
 
     @classmethod
@@ -113,11 +113,14 @@ class Template(metaclass=PoolMeta):
 
 class Product(StockMixin, object, metaclass=PoolMeta):
     __name__ = "product.product"
-    quantity = fields.Function(fields.Float('Quantity'), 'get_quantity',
-            searcher='search_quantity')
-    forecast_quantity = fields.Function(fields.Float('Forecast Quantity'),
-            'get_quantity', searcher='search_quantity')
-    cost_value = fields.Function(fields.Numeric('Cost Value'),
+    quantity = fields.Function(fields.Float('Quantity',
+        help="The amount of stock in the location."),
+        'get_quantity', searcher='search_quantity')
+    forecast_quantity = fields.Function(fields.Float('Forecast Quantity',
+        help="The amount of stock expected to be in the location."),
+        'get_quantity', searcher='search_quantity')
+    cost_value = fields.Function(fields.Numeric('Cost Value',
+        help="The value of the stock in the location."),
         'get_cost_value')
 
     @classmethod
@@ -293,10 +296,10 @@ class ProductByLocationContext(ModelView):
     'Product by Location'
     __name__ = 'product.by_location.context'
     forecast_date = fields.Date(
-        'At Date', help=('Allow to compute expected '
-            'stock quantities for this date.\n'
-            '* An empty value is an infinite date in the future.\n'
-            '* A date in the past will provide historical values.'))
+        'At Date',
+        help="The date for which the stock quantity is calculated.\n"
+        "* An empty value calculates as far ahead as possible.\n"
+        "* A date in the past will provide historical values.")
     stock_date_end = fields.Function(fields.Date('At Date'),
         'on_change_with_stock_date_end')
 
@@ -315,8 +318,24 @@ class ProductByLocationContext(ModelView):
 class ProductQuantitiesByWarehouse(ModelSQL, ModelView):
     'Product Quantities By Warehouse'
     __name__ = 'stock.product_quantities_warehouse'
-    date = fields.Date('Date')
+
+    class _Date(fields.Date):
+        def get(self, ids, model, name, values=None):
+            if values is None:
+                values = {}
+            result = {}
+            for v in values:
+                date = v[name]
+                # SQLite does not convert to date
+                if isinstance(date, str):
+                    date = datetime.date(*map(int, date.split('-', 2)))
+                result[v['id']] = date
+            return result
+
+    date = _Date('Date')
     quantity = fields.Function(fields.Float('Quantity'), 'get_quantity')
+
+    del _Date
 
     @classmethod
     def __setup__(cls):
@@ -414,7 +433,8 @@ class ProductQuantitiesByWarehouseContext(ModelView):
     warehouse = fields.Many2One('stock.location', 'Warehouse', required=True,
         domain=[
             ('type', '=', 'warehouse'),
-            ])
+            ],
+        help="The warehouse for which the quantities will be calculated.")
 
     @staticmethod
     def default_warehouse():

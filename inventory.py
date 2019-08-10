@@ -2,11 +2,15 @@
 # this repository contains the full copyright notices and license terms.
 from sql import Null
 
+from trytond.i18n import gettext
 from trytond.model import Workflow, Model, ModelView, ModelSQL, fields, Check
+from trytond.model.exceptions import AccessError
 from trytond.pyson import Eval, Bool, If
 from trytond.transaction import Transaction
 from trytond.pool import Pool
 from trytond.wizard import Wizard, StateView, StateTransition, Button
+
+from .exceptions import InventoryValidationError, InventoryCountWarning
 
 __all__ = ['Inventory', 'InventoryLine',
     'Count', 'CountSearch', 'CountQuantity']
@@ -26,20 +30,25 @@ class Inventory(Workflow, ModelSQL, ModelView):
     'Stock Inventory'
     __name__ = 'stock.inventory'
     _rec_name = 'number'
-    number = fields.Char('Number', readonly=True)
+    number = fields.Char('Number', readonly=True,
+        help="The main identifier for the inventory.")
     location = fields.Many2One(
         'stock.location', 'Location', required=True,
         domain=[('type', '=', 'storage')], states={
             'readonly': (Eval('state') != 'draft') | Eval('lines', [0]),
             },
-        depends=['state'])
+        depends=['state'],
+        help="The location inventoried.")
     date = fields.Date('Date', required=True, states={
             'readonly': (Eval('state') != 'draft') | Eval('lines', [0]),
             },
-        depends=['state'])
+        depends=['state'],
+        help="The date of the stock count.")
     lost_found = fields.Many2One(
         'stock.location', 'Lost and Found', required=True,
-        domain=[('type', '=', 'lost_found')], states=STATES, depends=DEPENDS)
+        domain=[('type', '=', 'lost_found')], states=STATES, depends=DEPENDS,
+        help="Used for the balancing entries needed when the stock is "
+        "corrected.")
     lines = fields.One2Many(
         'stock.inventory.line', 'inventory', 'Lines',
         states={
@@ -57,20 +66,16 @@ class Inventory(Workflow, ModelSQL, ModelView):
         states={
             'readonly': (Eval('state') != 'draft') | Eval('lines', [0]),
             },
-        depends=['state'])
+        depends=['state'],
+        help="The company the inventory is associated with.")
     state = fields.Selection(
-        INVENTORY_STATES, 'State', readonly=True, select=True)
+        INVENTORY_STATES, 'State', readonly=True, select=True,
+        help="The current state of the inventory.")
 
     @classmethod
     def __setup__(cls):
         super(Inventory, cls).__setup__()
         cls._order.insert(0, ('date', 'DESC'))
-        cls._error_messages.update({
-                'delete_cancel': ('Inventory "%s" must be canceled before '
-                    'deletion.'),
-                'unique_line': ('Line "%s" is not unique '
-                    'on Inventory "%s".'),
-                })
         cls._transitions |= set((
                 ('draft', 'done'),
                 ('draft', 'cancel'),
@@ -129,7 +134,9 @@ class Inventory(Workflow, ModelSQL, ModelView):
         cls.cancel(inventories)
         for inventory in inventories:
             if inventory.state != 'cancel':
-                cls.raise_user_error('delete_cancel', inventory.rec_name)
+                raise AccessError(
+                    gettext('stock.msg_inventory_delete_cancel',
+                        inventory=inventory.rec_name))
         super(Inventory, cls).delete(inventories)
 
     @classmethod
@@ -143,8 +150,10 @@ class Inventory(Workflow, ModelSQL, ModelView):
             for line in inventory.lines:
                 key = line.unique_key
                 if key in keys:
-                    cls.raise_user_error('unique_line',
-                        (line.rec_name, inventory.rec_name))
+                    raise InventoryValidationError(
+                        gettext('stock.msg_inventory_line_unique',
+                            line=line.rec_name,
+                            inventory=inventory.rec_name))
                 keys.add(key)
                 move = line.get_move()
                 if move:
@@ -290,7 +299,8 @@ class InventoryLine(ModelSQL, ModelView):
             ('type', '=', 'goods'),
             ('consumable', '=', False),
             ], states=_states, depends=_depends)
-    uom = fields.Function(fields.Many2One('product.uom', 'UOM'), 'get_uom')
+    uom = fields.Function(fields.Many2One('product.uom', 'UOM',
+        help="The unit in which the quantity is specified."), 'get_uom')
     unit_digits = fields.Function(fields.Integer('Unit Digits'),
             'get_unit_digits')
     expected_quantity = fields.Float('Expected Quantity', required=True,
@@ -298,17 +308,20 @@ class InventoryLine(ModelSQL, ModelView):
         states={
             'invisible': Eval('id', -1) < 0,
         },
-        depends=['unit_digits'])
+        depends=['unit_digits'],
+        help="The quantity the system calculated should be in the location.")
     quantity = fields.Float('Quantity',
         digits=(16, Eval('unit_digits', 2)),
-        states=_states, depends=['unit_digits'] + _depends)
+        states=_states, depends=['unit_digits'] + _depends,
+        help="The actual quantity found in the location.")
     moves = fields.One2Many('stock.move', 'origin', 'Moves', readonly=True)
     inventory = fields.Many2One('stock.inventory', 'Inventory', required=True,
         ondelete='CASCADE',
         states={
             'readonly': _states['readonly'] & Bool(Eval('inventory')),
             },
-        depends=_depends)
+        depends=_depends,
+        help="The inventory the line belongs to.")
     inventory_state = fields.Function(
         fields.Selection(INVENTORY_STATES, 'Inventory State'),
         'on_change_with_inventory_state')
@@ -319,15 +332,9 @@ class InventoryLine(ModelSQL, ModelView):
         t = cls.__table__()
         cls._sql_constraints += [
             ('check_line_qty_pos', Check(t, t.quantity >= 0),
-                'Line quantity must be positive.'),
+                'stock.msg_inventory_line_quantity_positive'),
             ]
         cls._order.insert(0, ('product', 'ASC'))
-        cls._error_messages.update({
-                'missing_empty_quantity': ('An option for empty quantity is '
-                    'missing for inventory "%(inventory)s".'),
-                'delete_cancel_draft': ('The line "%(line)s" must be on '
-                    'canceled or draft inventory to be deleted.'),
-                })
 
     @classmethod
     def __register__(cls, module_name):
@@ -417,9 +424,9 @@ class InventoryLine(ModelSQL, ModelView):
         qty = self.quantity
         if qty is None:
             if self.inventory.empty_quantity is None:
-                self.raise_user_error('missing_empty_quantity', {
-                        'inventory': self.inventory.rec_name,
-                        })
+                raise InventoryValidationError(
+                    gettext('stock.msg_inventory_missing_empty_quantity',
+                        inventory=self.inventory.rec_name))
             if self.inventory.empty_quantity == 'keep':
                 return
             else:
@@ -472,9 +479,10 @@ class InventoryLine(ModelSQL, ModelView):
     def delete(cls, lines):
         for line in lines:
             if line.inventory_state not in {'cancel', 'draft'}:
-                cls.raise_user_error('delete_cancel_draft', {
-                        'line': line.rec_name,
-                        })
+                raise AccessError(
+                    gettext('stock.msg_inventory_line_delete_cancel',
+                        line=line.rec_name,
+                        inventory=line.inventory.rec_name))
         super(InventoryLine, cls).delete(lines)
 
 
@@ -497,17 +505,11 @@ class Count(Wizard):
             ])
     add = StateTransition()
 
-    @classmethod
-    def __setup__(cls):
-        super(Count, cls).__setup__()
-        cls._error_messages.update({
-                'create_line': "No existing line found for %(search)s.",
-                })
-
     def default_quantity(self, fields):
         pool = Pool()
         Inventory = pool.get('stock.inventory')
         InventoryLine = pool.get('stock.inventory.line')
+        Warning = pool.get('res.user.warning')
         context = Transaction().context
         inventory = Inventory(context['active_id'])
         values = {}
@@ -515,9 +517,10 @@ class Count(Wizard):
         if not lines:
             warning_name = '%s.%s.count_create' % (
                 inventory, self.search.search)
-            self.raise_user_warning(warning_name, 'create_line', {
-                    'search': self.search.search.rec_name,
-                    })
+            if Warning.check(warning_name):
+                raise InventoryCountWarning(warning_name,
+                    gettext('stock.msg_inventory_count_create_line',
+                        search=self.search.search.rec_name))
             line, = InventoryLine.create([self.get_line_values(inventory)])
         else:
             line, = lines
@@ -574,7 +577,8 @@ class CountSearch(ModelView):
                     ('consumable', '=', False),
                     ],
                 [])],
-        depends=['search_model'])
+        depends=['search_model'],
+        help="The item that's counted.")
     search_model = fields.Function(fields.Selection(
         'get_search_models', "Search Model"),
         'on_change_with_search_model')
@@ -600,19 +604,22 @@ class CountQuantity(ModelView):
     line = fields.Many2One(
         'stock.inventory.line', "Line", readonly=True, required=True)
     product = fields.Many2One('product.product', "Product", readonly=True)
-    uom = fields.Many2One('product.uom', "UOM", readonly=True)
-    quantity_resulting = fields.Float(
-        "Resulting Quantity", digits=(16, Eval('unit_digits', 2)),
-        readonly=True, depends=['unit_digits'])
+    uom = fields.Many2One('product.uom', "UOM", readonly=True,
+        help="The unit in which the quantities are specified.")
+    total_quantity = fields.Float(
+        "Total Quantity", digits=(16, Eval('unit_digits', 2)),
+        readonly=True, depends=['unit_digits'],
+        help="The total amount of the line counted so far.")
 
     quantity_added = fields.Float(
         "Added Quantity", digits=(16, Eval('unit_digits', 2)), required=True,
-        depends=['unit_digits'])
+        depends=['unit_digits'],
+        help="The quantity to add to the existing count.")
 
     unit_digits = fields.Integer("Unit Digits", readonly=True)
 
     @fields.depends('quantity_added', 'line')
     def on_change_quantity_added(self):
         if self.line:
-            self.quantity_resulting = (
+            self.total_quantity = (
                 (self.line.quantity or 0) + (self.quantity_added or 0))

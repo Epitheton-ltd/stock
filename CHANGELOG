@@ -1,5 +1,12 @@
-Version 5.0.1 - 2018-11-12
+Version 5.2.1 - 2019-06-10
 * Bug fixes (see mercurial logs for details)
+
+Version 5.2.0 - 2019-05-06
+* Bug fixes (see mercurial logs for details)
+* Don't set default unit price on stock move
+* Prefer to pick product from the source location
+* Change move attribute of ShipmentReport for a method
+* Rename inventory count quantity_resulting to total_quantity
 
 Version 5.0.0 - 2018-10-01
 * Bug fixes (see mercurial logs for details)

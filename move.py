@@ -11,13 +11,17 @@ from sql import Literal, Union, Column, Null, For
 from sql.aggregate import Sum
 from sql.conditionals import Coalesce, Case
 
+from trytond.i18n import gettext
 from trytond.model import Workflow, Model, ModelView, ModelSQL, fields, Check
+from trytond.model.exceptions import AccessError
 from trytond.pyson import Eval, If, Bool
 from trytond.tools import reduce_ids
 from trytond.transaction import Transaction
 from trytond.pool import Pool
 
 from trytond.modules.product import price_digits
+
+from .exceptions import MoveOriginWarning
 
 __all__ = ['StockMixin', 'Move']
 
@@ -161,54 +165,68 @@ class Move(Workflow, ModelSQL, ModelView):
                 ('default_uom_category', '=', Eval('product_uom_category')),
                 ())
             ],
-        depends=DEPENDS + ['product_uom_category'])
+        depends=DEPENDS + ['product_uom_category'],
+        help="The product that the move is associated with.")
     product_uom_category = fields.Function(
         fields.Many2One('product.uom.category', 'Product Uom Category'),
         'on_change_with_product_uom_category')
-    uom = fields.Many2One("product.uom", "Uom", required=True, states=STATES,
+    uom = fields.Many2One("product.uom", "Uom", required=True,
+        states={
+            'readonly': (Eval('state').in_(['cancel', 'assigned', 'done'])
+                | Eval('unit_price')),
+            },
         domain=[
             ('category', '=', Eval('product_uom_category')),
             ],
-        depends=['state', 'product_uom_category'])
+        depends=['state', 'unit_price', 'product_uom_category'],
+        help="The unit in which the quantity is specified.")
     unit_digits = fields.Function(fields.Integer('Unit Digits'),
         'on_change_with_unit_digits')
     quantity = fields.Float("Quantity", required=True,
         digits=(16, Eval('unit_digits', 2)), states=STATES,
-        depends=['state', 'unit_digits'])
+        depends=['state', 'unit_digits'],
+        help="The amount of stock moved.")
     internal_quantity = fields.Float('Internal Quantity', readonly=True,
         required=True)
     from_location = fields.Many2One("stock.location", "From Location",
         select=True, required=True, states=STATES,
-        depends=DEPENDS + LOCATION_DEPENDS, domain=LOCATION_DOMAIN)
+        depends=DEPENDS + LOCATION_DEPENDS, domain=LOCATION_DOMAIN,
+        help="Where the stock is moved from.")
     to_location = fields.Many2One("stock.location", "To Location", select=True,
         required=True, states=STATES,
-        depends=DEPENDS + LOCATION_DEPENDS, domain=LOCATION_DOMAIN)
+        depends=DEPENDS + LOCATION_DEPENDS, domain=LOCATION_DOMAIN,
+        help="Where the stock is moved to.")
     shipment = fields.Reference('Shipment', selection='get_shipment',
-        readonly=True, select=True)
+        readonly=True, select=True,
+        help="Used to group several stock moves together.")
     origin = fields.Reference('Origin', selection='get_origin', select=True,
         states={
             'readonly': Eval('state') != 'draft',
             },
-        depends=['state'])
+        depends=['state'],
+        help="The source of the stock move.")
     planned_date = fields.Date("Planned Date", states={
             'readonly': (Eval('state').in_(['cancel', 'assigned', 'done'])
                 | Eval('shipment'))
             }, depends=['state', 'shipment'],
-        select=True)
+        select=True,
+        help="When the stock is expected to be moved.")
     effective_date = fields.Date("Effective Date", select=True,
         states={
             'required': Eval('state') == 'done',
             'readonly': (Eval('state').in_(['cancel', 'done'])
                 | Eval('shipment')),
             },
-        depends=['state', 'shipment'])
+        depends=['state', 'shipment'],
+        help="When the stock was actually moved.")
     state = fields.Selection([
         ('staging', 'Staging'),
         ('draft', 'Draft'),
         ('assigned', 'Assigned'),
         ('done', 'Done'),
         ('cancel', 'Canceled'),
-        ], 'State', select=True, readonly=True)
+        ], 'State', select=True, readonly=True,
+        help="The current state of the stock move.")
     company = fields.Many2One('company.company', 'Company', required=True,
         states={
             'readonly': Eval('state') != 'draft',
@@ -217,7 +235,8 @@ class Move(Workflow, ModelSQL, ModelView):
             ('id', If(Eval('context', {}).contains('company'), '=', '!='),
                 Eval('context', {}).get('company', -1)),
             ],
-        depends=['state'])
+        depends=['state'],
+        help="The company the stock move is associated with.")
     unit_price = fields.Numeric('Unit Price', digits=price_digits,
         states={
             'invisible': ~Eval('unit_price_required'),
@@ -233,7 +252,8 @@ class Move(Workflow, ModelSQL, ModelView):
             'required': Bool(Eval('unit_price_required')),
             'readonly': Eval('state') != 'draft',
             },
-        depends=['unit_price_required', 'state'])
+        depends=['unit_price_required', 'state'],
+        help="The currency in which the unit price is specified.")
     unit_price_required = fields.Function(
         fields.Boolean('Unit Price Required'),
         'on_change_with_unit_price_required')
@@ -253,31 +273,15 @@ class Move(Workflow, ModelSQL, ModelView):
         t = cls.__table__()
         cls._sql_constraints += [
             ('check_move_qty_pos', Check(t, t.quantity >= 0),
-                'Move quantity must be positive'),
+                'stock.msg_move_quantity_positive'),
             ('check_move_internal_qty_pos',
                 Check(t, t.internal_quantity >= 0),
-                'Internal move quantity must be positive'),
+                'stock.msg_move_internal_quantity_positive'),
             ('check_from_to_locations',
                 Check(t, t.from_location != t.to_location),
-                'Source and destination location must be different'),
+                'stock.msg_move_from_to_location'),
             ]
         cls._order[0] = ('id', 'DESC')
-        cls._error_messages.update({
-            'set_state_draft': ('You can not set stock move "%s" to draft '
-                'state.'),
-            'set_state_assigned': ('You can not set stock move "%s" to '
-                'assigned state.'),
-            'set_state_done': 'You can not set stock move "%s" to done state.',
-            'delele_state': ('You can not delete stock move "%s" because '
-                'it is not in staging, draft nor cancelled state.'),
-            'period_closed': ('You can not modify move "%(move)s" because '
-                'period "%(period)s" is closed.'),
-            'modify_assigned': ('You can not modify stock move "%s" because '
-                'it is in "Assigned" state.'),
-            'modify_done_cancel': ('You can not modify stock move "%s" '
-                'because it is in "Done" or "Cancel" state.'),
-            'no_origin': 'The stock moves "%s" have no origin.',
-            })
         cls._transitions |= set((
                 ('staging', 'draft'),
                 ('staging', 'cancel'),
@@ -358,55 +362,18 @@ class Move(Workflow, ModelSQL, ModelView):
             return self.uom.digits
         return 2
 
-    @fields.depends('product', 'currency', 'uom', 'company', 'from_location',
-        'to_location')
+    @fields.depends('product', 'uom')
     def on_change_product(self):
-        pool = Pool()
-        Uom = pool.get('product.uom')
-        Currency = pool.get('currency.currency')
-
-        self.unit_price = Decimal('0.0')
         if self.product:
-            self.uom = self.product.default_uom
-            self.unit_digits = self.product.default_uom.digits
-            unit_price = None
-            if self.from_location and self.from_location.type in ('supplier',
-                    'production'):
-                unit_price = self.product.cost_price
-            elif self.to_location and self.to_location.type == 'customer':
-                unit_price = self.product.list_price
-            if unit_price:
-                if self.uom != self.product.default_uom:
-                    unit_price = Uom.compute_price(self.product.default_uom,
-                        unit_price, self.uom)
-                if self.currency and self.company:
-                    unit_price = Currency.compute(self.company.currency,
-                        unit_price, self.currency, round=False)
-                self.unit_price = unit_price
+            if (not self.uom
+                    or self.uom.category != self.product.default_uom.category):
+                self.uom = self.product.default_uom
+                self.unit_digits = self.product.default_uom.digits
 
     @fields.depends('product')
     def on_change_with_product_uom_category(self, name=None):
         if self.product:
             return self.product.default_uom_category.id
-
-    @fields.depends('product', 'currency', 'uom', 'company', 'from_location',
-        'to_location')
-    def on_change_uom(self):
-        pool = Pool()
-        Uom = pool.get('product.uom')
-        Currency = pool.get('currency.currency')
-
-        self.unit_price = Decimal('0.0')
-        if self.product:
-            if self.to_location and self.to_location.type == 'storage':
-                unit_price = self.product.cost_price
-                if self.uom and self.uom != self.product.default_uom:
-                    unit_price = Uom.compute_price(self.product.default_uom,
-                        unit_price, self.uom)
-                if self.currency and self.company:
-                    unit_price = Currency.compute(self.company.currency,
-                        unit_price, self.currency, round=False)
-                self.unit_price = unit_price
 
     @fields.depends('from_location', 'to_location')
     def on_change_with_unit_price_required(self, name=None):
@@ -480,10 +447,10 @@ class Move(Workflow, ModelSQL, ModelView):
                     date = (move.effective_date if move.effective_date
                         else move.planned_date)
                     if date and date <= period.date:
-                        cls.raise_user_error('period_closed', {
-                                'move': move.rec_name,
-                                'period': period.rec_name,
-                                })
+                        raise AccessError(
+                            gettext('stock.msg_move_modify_period_close',
+                                move=move.rec_name,
+                                period=period.rec_name))
 
     def get_rec_name(self, name):
         return ("%s%s %s"
@@ -689,12 +656,15 @@ class Move(Workflow, ModelSQL, ModelView):
             if cls._deny_modify_assigned & vals_set:
                 for move in moves:
                     if move.state == 'assigned':
-                        cls.raise_user_error('modify_assigned', move.rec_name)
+                        raise AccessError(
+                            gettext('stock.msg_move_modify_assigned',
+                                move=move.rec_name))
             if cls._deny_modify_done_cancel & vals_set:
                 for move in moves:
                     if move.state in ('done', 'cancel'):
-                        cls.raise_user_error('modify_done_cancel',
-                            (move.rec_name,))
+                        raise AccessError(
+                            gettext('stock.msg_move_modify_%s' % move.state,
+                                move=move.rec_name))
 
         super(Move, cls).write(*args)
 
@@ -719,7 +689,9 @@ class Move(Workflow, ModelSQL, ModelView):
     def delete(cls, moves):
         for move in moves:
             if move.state not in {'staging', 'draft', 'cancel'}:
-                cls.raise_user_error('delele_state', (move.rec_name,))
+                raise AccessError(
+                    gettext('stock.msg_move_delete_draft_cancel',
+                        move=move.rec_name))
         super(Move, cls).delete(moves)
 
     @staticmethod
@@ -729,6 +701,8 @@ class Move(Workflow, ModelSQL, ModelView):
 
     @classmethod
     def check_origin(cls, moves, types=None):
+        pool = Pool()
+        Warning = pool.get('res.user.warning')
         if types is None:
             types = cls.check_origin_types()
         if not types:
@@ -745,7 +719,10 @@ class Move(Workflow, ModelSQL, ModelView):
                 names += '...'
             warning_name = '%s.done' % hashlib.md5(
                 str(moves).encode('utf-8')).hexdigest()
-            cls.raise_user_warning(warning_name, 'no_origin', names)
+            if Warning.check(warning_name):
+                raise MoveOriginWarning(warning_name,
+                    gettext('stock.msg_move_no_origin',
+                        moves=names))
 
     def pick_product(self, location_quantities):
         """
@@ -861,6 +838,7 @@ class Move(Workflow, ModelSQL, ModelView):
                 if childs is None:
                     childs = Location.search([
                             ('parent', 'child_of', [move.from_location.id]),
+                            ('type', '!=', 'view'),
                             ])
                     child_locations[move.from_location] = childs
             else:
@@ -871,6 +849,13 @@ class Move(Workflow, ModelSQL, ModelView):
                     location_qties[location] = Uom.compute_qty(
                         move.product.default_uom, pbl[key], move.uom,
                         round=False)
+            # Prevent to pick from the destination location
+            location_qties.pop(move.to_location, None)
+            try:
+                # Try first to pick from source location
+                location_qties.move_to_end(move.from_location, last=False)
+            except KeyError:
+                pass
 
             to_pick = move.pick_product(location_qties)
 
@@ -985,7 +970,7 @@ class Move(Workflow, ModelSQL, ModelView):
             product = Product.__table__()
             columns = ['id', 'state', 'effective_date', 'planned_date',
             'internal_quantity', 'from_location', 'to_location']
-            columns += list(grouping)
+            columns += [c for c in grouping if c not in columns]
             columns = [get_column(c, move, product) for c in columns]
             move = (move
                 .join(product, condition=move.product == product.id)
@@ -998,7 +983,7 @@ class Move(Workflow, ModelSQL, ModelView):
             if use_product:
                 product_cache = Product.__table__()
                 columns = ['internal_quantity', 'period', 'location']
-                columns += list(grouping)
+                columns += [c for c in grouping if c not in columns]
                 columns = [get_column(c, period_cache, product_cache)
                     for c in columns]
                 period_cache = (period_cache
@@ -1014,7 +999,8 @@ class Move(Workflow, ModelSQL, ModelView):
             to_location = Location.__table__()
             to_parent_location = Location.__table__()
             columns = ['id', 'state', 'effective_date', 'planned_date',
-                'internal_quantity'] + list(grouping)
+                'internal_quantity']
+            columns += [c for c in grouping if c not in columns]
             columns = [Column(move, c).as_(c) for c in columns]
 
             move_with_parent = (move
@@ -1340,7 +1326,7 @@ class Move(Workflow, ModelSQL, ModelView):
             Model = Template
         id_getter = operator.itemgetter(grouping.index(id_name) + 1)
         ids = set()
-        quantities = defaultdict(lambda: 0)
+        quantities = defaultdict(int)
         keys = set()
         # We can do a quick loop without propagation if the request is for a
         # single location because all the locations are children and we can sum

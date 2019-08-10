@@ -7,7 +7,9 @@ from functools import partial
 
 from sql import Null
 
+from trytond.i18n import gettext
 from trytond.model import Workflow, ModelView, ModelSQL, fields
+from trytond.model.exceptions import AccessError
 from trytond.modules.company import CompanyReport
 from trytond.wizard import Wizard, StateTransition, StateView, Button
 from trytond.pyson import Eval, If, Id, Bool
@@ -66,10 +68,12 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state').in_(['cancel', 'done']),
             },
-        depends=['state'])
+        depends=['state'],
+        help="When the stock was actually received.")
     planned_date = fields.Date('Planned Date', states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="When the stock is expected to be received.")
     company = fields.Many2One('company.company', 'Company', required=True,
         states={
             'readonly': Eval('state') != 'draft',
@@ -78,18 +82,21 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
             ('id', If(Eval('context', {}).contains('company'), '=', '!='),
                 Eval('context', {}).get('company', -1)),
             ],
-        depends=['state'])
+        depends=['state'],
+        help="The company the shipment is associated with.")
     reference = fields.Char("Reference", size=None, select=True,
         states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="The supplier's identifier for the shipment.")
     supplier = fields.Many2One('party.party', 'Supplier',
         states={
             'readonly': (((Eval('state') != 'draft')
                     | Eval('incoming_moves', [0]))
                 & Eval('supplier')),
             }, required=True,
-        depends=['state', 'supplier'])
+        depends=['state', 'supplier'],
+        help="The party that supplied the stock.")
     supplier_location = fields.Function(fields.Many2One('stock.location',
             'Supplier Location'),
         'on_change_with_supplier_location')
@@ -97,13 +104,15 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state') != 'draft',
             }, domain=[('party', '=', Eval('supplier'))],
-        depends=['state', 'supplier'])
+        depends=['state', 'supplier'],
+        help="The address at which the supplier can be contacted.")
     warehouse = fields.Many2One('stock.location', "Warehouse",
         required=True, domain=[('type', '=', 'warehouse')],
         states={
             'readonly': (Eval('state').in_(['cancel', 'done'])
                 | Eval('incoming_moves', [0]) | Eval('inventory_moves', [0])),
-            }, depends=['state'])
+            }, depends=['state'],
+        help="Where the stock is received.")
     warehouse_input = fields.Function(fields.Many2One('stock.location',
             'Warehouse Input'),
         'on_change_with_warehouse_input')
@@ -134,7 +143,8 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
                     | ~Eval('warehouse') | ~Eval('supplier')),
                 },
             depends=['state', 'warehouse', 'supplier_location',
-                'warehouse_input', 'warehouse_storage', 'company']),
+                'warehouse_input', 'warehouse_storage', 'company'],
+            help="The moves that bring the stock into the warehouse."),
         'get_incoming_moves', setter='set_incoming_moves')
     inventory_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Inventory Moves',
@@ -152,13 +162,15 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
                     Eval('warehouse_input') == Eval('warehouse_storage')),
                 },
             depends=['state', 'warehouse', 'warehouse_input',
-                'warehouse_storage', 'company']),
+                'warehouse_storage', 'company'],
+            help="The moves that put the stock away into the storage area."),
         'get_inventory_moves', setter='set_inventory_moves')
     moves = fields.One2Many('stock.move', 'shipment', 'Moves',
         domain=[('company', '=', Eval('company'))], readonly=True,
         depends=['company'])
     origins = fields.Function(fields.Char('Origins'), 'get_origins')
-    number = fields.Char('Number', size=None, select=True, readonly=True)
+    number = fields.Char('Number', size=None, select=True, readonly=True,
+        help="The main identifier for the shipment.")
     received_by = employee_field("Received By")
     done_by = employee_field("Done By")
     state = fields.Selection([
@@ -166,20 +178,13 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         ('done', 'Done'),
         ('cancel', 'Canceled'),
         ('received', 'Received'),
-        ], 'State', readonly=True)
+        ], 'State', readonly=True,
+        help="The current state of the shipment.")
 
     @classmethod
     def __setup__(cls):
         super(ShipmentIn, cls).__setup__()
         cls._order[0] = ('id', 'DESC')
-        cls._error_messages.update({
-                'incoming_move_input_dest': ('Incoming Moves must have '
-                    'the warehouse input location as destination location.'),
-                'inventory_move_input_source': ('Inventory Moves must '
-                    'have the warehouse input location as source location.'),
-                'delete_cancel': ('Supplier Shipment "%s" must be cancelled '
-                    'before deletion.'),
-                })
         cls._transitions |= set((
                 ('draft', 'received'),
                 ('received', 'done'),
@@ -372,8 +377,8 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         default.setdefault('done_by', None)
         return super(ShipmentIn, cls).copy(shipments, default=default)
 
-    @classmethod
-    def _get_inventory_moves(cls, incoming_move):
+    def _get_inventory_move(self, incoming_move):
+        'Return inventory move for the incoming move'
         pool = Pool()
         Move = pool.get('stock.move')
         if incoming_move.quantity <= 0.0:
@@ -383,7 +388,7 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         move.uom = incoming_move.uom
         move.quantity = incoming_move.quantity
         move.from_location = incoming_move.to_location
-        move.to_location = incoming_move.shipment.warehouse_storage
+        move.to_location = self.warehouse_storage
         move.state = Move.default_state()
         # Product will be considered in stock only when the inventory
         # move will be made:
@@ -402,7 +407,7 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
             # moves, it will reset also the incoming_moves
             moves = list(shipment.moves)
             for incoming_move in shipment.incoming_moves:
-                move = cls._get_inventory_moves(incoming_move)
+                move = shipment._get_inventory_move(incoming_move)
                 if move:
                     moves.append(move)
             shipment.moves = moves
@@ -415,7 +420,9 @@ class ShipmentIn(Workflow, ModelSQL, ModelView):
         cls.cancel(shipments)
         for shipment in shipments:
             if shipment.state != 'cancel':
-                cls.raise_user_error('delete_cancel', shipment.rec_name)
+                raise AccessError(
+                    gettext('stock.msg_shipment_delete_cancel',
+                        shipment=shipment.rec_name))
         Move.delete([m for s in shipments for m in s.moves])
         super(ShipmentIn, cls).delete(shipments)
 
@@ -474,11 +481,13 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state').in_(['cancel', 'done']),
             },
-        depends=['state'])
+        depends=['state'],
+        help="When the stock was actually returned.")
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="When the stock is expected to be returned.")
     company = fields.Many2One('company.company', 'Company', required=True,
         states={
             'readonly': Eval('state') != 'draft',
@@ -487,19 +496,23 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
             ('id', If(Eval('context', {}).contains('company'), '=', '!='),
                 Eval('context', {}).get('company', -1)),
             ],
-        depends=['state'])
-    number = fields.Char('Number', size=None, select=True, readonly=True)
+        depends=['state'],
+        help="The company the shipment is associated with.")
+    number = fields.Char('Number', size=None, select=True, readonly=True,
+        help="The main identifier for the shipment.")
     reference = fields.Char("Reference", size=None, select=True,
         states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="The supplier's identifier for the shipment.")
     supplier = fields.Many2One('party.party', 'Supplier',
         states={
             'readonly': (((Eval('state') != 'draft')
                     | Eval('moves', [0]))
                     & Eval('supplier', 0)),
             }, required=True,
-        depends=['state', 'supplier'])
+        depends=['state', 'supplier'],
+        help="The party that supplied the stock.")
     delivery_address = fields.Many2One('party.address', 'Delivery Address',
         states={
             'readonly': Eval('state') != 'draft',
@@ -507,17 +520,20 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
         domain=[
             ('party', '=', Eval('supplier'))
             ],
-        depends=['state', 'supplier'])
+        depends=['state', 'supplier'],
+        help="Where the stock is sent to.")
     from_location = fields.Many2One('stock.location', "From Location",
         required=True, states={
             'readonly': (Eval('state') != 'draft') | Eval('moves', [0]),
             }, domain=[('type', 'in', ['storage', 'view'])],
-        depends=['state'])
+        depends=['state'],
+        help="Where the stock is moved from.")
     to_location = fields.Many2One('stock.location', "To Location",
         required=True, states={
             'readonly': (Eval('state') != 'draft') | Eval('moves', [0]),
             }, domain=[('type', '=', 'supplier')],
-        depends=['state'])
+        depends=['state'],
+        help="Where the stock is moved to.")
     moves = fields.One2Many('stock.move', 'shipment', 'Moves',
         states={
             'readonly': (((Eval('state') != 'draft') | ~Eval('from_location'))
@@ -537,7 +553,8 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
                     [])),
             ('company', '=', Eval('company')),
             ],
-        depends=['state', 'from_location', 'to_location', 'company'])
+        depends=['state', 'from_location', 'to_location', 'company'],
+        help="The moves that return the stock to the supplier.")
     origins = fields.Function(fields.Char('Origins'), 'get_origins')
     assigned_by = employee_field("Assigned By")
     done_by = employee_field("Done By")
@@ -547,16 +564,13 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
         ('assigned', 'Assigned'),
         ('waiting', 'Waiting'),
         ('done', 'Done'),
-        ], 'State', readonly=True)
+        ], 'State', readonly=True,
+        help="The current state of the shipment.")
 
     @classmethod
     def __setup__(cls):
         super(ShipmentInReturn, cls).__setup__()
         cls._order[0] = ('id', 'DESC')
-        cls._error_messages.update({
-                'delete_cancel': ('Supplier Return Shipment "%s" must be '
-                    'cancelled before deletion.'),
-                })
         cls._transitions |= set((
                 ('draft', 'waiting'),
                 ('waiting', 'assigned'),
@@ -680,7 +694,9 @@ class ShipmentInReturn(Workflow, ModelSQL, ModelView):
         cls.cancel(shipments)
         for shipment in shipments:
             if shipment.state != 'cancel':
-                cls.raise_user_error('delete_cancel', shipment.rec_name)
+                raise AccessError(
+                    gettext('stock.msg_shipment_delete_cancel',
+                        shipment=shipment.rec_name))
         Move.delete([m for s in shipments for m in s.moves])
         super(ShipmentInReturn, cls).delete(shipments)
 
@@ -791,11 +807,13 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state').in_(['cancel', 'done']),
             },
-        depends=['state'])
+        depends=['state'],
+        help="When the stock was actually sent.")
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="When the stock is expected to be sent.")
     company = fields.Many2One('company.company', 'Company', required=True,
         states={
             'readonly': Eval('state') != 'draft',
@@ -804,13 +822,15 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
             ('id', If(Eval('context', {}).contains('company'), '=', '!='),
                 Eval('context', {}).get('company', -1)),
             ],
-        depends=['state'])
+        depends=['state'],
+        help="The company the shipment is associated with.")
     customer = fields.Many2One('party.party', 'Customer', required=True,
         states={
             'readonly': ((Eval('state') != 'draft')
                 | Eval('outgoing_moves', [0])),
             },
-        depends=['state'])
+        depends=['state'],
+        help="The party that purchased the stock.")
     customer_location = fields.Function(fields.Many2One('stock.location',
             'Customer Location'), 'on_change_with_customer_location')
     delivery_address = fields.Many2One('party.address',
@@ -818,17 +838,20 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state') != 'draft',
             }, domain=[('party', '=', Eval('customer'))],
-        depends=['state', 'customer'])
+        depends=['state', 'customer'],
+        help="Where the stock is sent to.")
     reference = fields.Char("Reference", size=None, select=True,
         states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="The customer's identifier for the shipment.")
     warehouse = fields.Many2One('stock.location', "Warehouse", required=True,
         states={
             'readonly': ((Eval('state') != 'draft')
                 | Eval('outgoing_moves', [0]) | Eval('inventory_moves', [0])),
             }, domain=[('type', '=', 'warehouse')],
-        depends=['state'])
+        depends=['state'],
+        help="Where the stock is sent from.")
     warehouse_storage = fields.Function(fields.Many2One('stock.location',
             'Warehouse Storage'), 'on_change_with_warehouse_storage')
     warehouse_output = fields.Function(fields.Many2One('stock.location',
@@ -846,7 +869,8 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
                     | ~Eval('warehouse') | ~Eval('customer')),
                 },
             depends=['state', 'warehouse', 'customer', 'warehouse_output',
-                'customer_location', 'company']),
+                'customer_location', 'company'],
+            help="The moves that send the stock to the customer."),
         'get_outgoing_moves', setter='set_outgoing_moves')
     inventory_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Inventory Moves',
@@ -865,13 +889,15 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
                     Eval('warehouse_storage') == Eval('warehouse_output')),
                 },
             depends=['state', 'warehouse', 'warehouse_storage',
-                'warehouse_output', 'company']),
+                'warehouse_output', 'company'],
+            help="The moves that pick the stock from the storage area."),
         'get_inventory_moves', setter='set_inventory_moves')
     moves = fields.One2Many('stock.move', 'shipment', 'Moves',
         domain=[('company', '=', Eval('company'))], depends=['company'],
         readonly=True)
     origins = fields.Function(fields.Char('Origins'), 'get_origins')
-    number = fields.Char('Number', size=None, select=True, readonly=True)
+    number = fields.Char('Number', size=None, select=True, readonly=True,
+        help="The main identifier for the shipment.")
     assigned_by = employee_field("Assigned By")
     packed_by = employee_field("Packed By")
     done_by = employee_field("Done By")
@@ -882,16 +908,13 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         ('assigned', 'Assigned'),
         ('packed', 'Packed'),
         ('waiting', 'Waiting'),
-        ], 'State', readonly=True)
+        ], 'State', readonly=True,
+        help="The current state of the shipment.")
 
     @classmethod
     def __setup__(cls):
         super(ShipmentOut, cls).__setup__()
         cls._order[0] = ('id', 'DESC')
-        cls._error_messages.update({
-                'delete_cancel': ('Customer Shipment "%s" must be cancelled '
-                    'before deletion.'),
-                })
         cls._transitions |= set((
                 ('draft', 'waiting'),
                 ('waiting', 'assigned'),
@@ -1305,7 +1328,9 @@ class ShipmentOut(Workflow, ModelSQL, ModelView):
         cls.cancel(shipments)
         for shipment in shipments:
             if shipment.state != 'cancel':
-                cls.raise_user_error('delete_cancel', shipment.rec_name)
+                raise AccessError(
+                    gettext('stock.msg_shipment_delete_cancel',
+                        shipment=shipment.rec_name))
         Move.delete([m for s in shipments for m in s.moves])
         super(ShipmentOut, cls).delete(shipments)
 
@@ -1355,11 +1380,13 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state').in_(['cancel', 'done']),
             },
-        depends=['state'])
+        depends=['state'],
+        help="When the stock was returned.")
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="When the stock is expected to be returned.")
     company = fields.Many2One('company.company', 'Company', required=True,
         states={
             'readonly': Eval('state') != 'draft',
@@ -1368,13 +1395,15 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
             ('id', If(Eval('context', {}).contains('company'), '=', '!='),
                 Eval('context', {}).get('company', -1)),
             ],
-        depends=['state'])
+        depends=['state'],
+        help="The company the shipment is associated with.")
     customer = fields.Many2One('party.party', 'Customer', required=True,
         states={
             'readonly': ((Eval('state') != 'draft')
                 | Eval('incoming_moves', [0])),
             },
-        depends=['state'])
+        depends=['state'],
+        help="The party that purchased the stock.")
     customer_location = fields.Function(fields.Many2One('stock.location',
             'Customer Location'), 'on_change_with_customer_location')
     delivery_address = fields.Many2One('party.address',
@@ -1382,17 +1411,20 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state') != 'draft',
             }, domain=[('party', '=', Eval('customer'))],
-        depends=['state', 'customer'])
+        depends=['state', 'customer'],
+        help="The address the customer can be contacted at.")
     reference = fields.Char("Reference", size=None, select=True,
         states={
             'readonly': Eval('state') != 'draft',
-            }, depends=['state'])
+            }, depends=['state'],
+        help="The customer's identifier for the shipment.")
     warehouse = fields.Many2One('stock.location', "Warehouse", required=True,
         states={
             'readonly': ((Eval('state') != 'draft')
                 | Eval('incoming_moves', [0]) | Eval('inventory_moves', [0])),
             }, domain=[('type', '=', 'warehouse')],
-        depends=['state'])
+        depends=['state'],
+        help="Where the stock is returned.")
     warehouse_storage = fields.Function(fields.Many2One('stock.location',
             'Warehouse Storage'), 'on_change_with_warehouse_storage')
     warehouse_input = fields.Function(fields.Many2One('stock.location',
@@ -1412,7 +1444,8 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
                     | ~Eval('warehouse') | ~Eval('customer')),
                 },
             depends=['state', 'warehouse', 'customer', 'customer_location',
-                'warehouse_input', 'warehouse_storage', 'company']),
+                'warehouse_input', 'warehouse_storage', 'company'],
+            help="The moves that bring the stock into the warehouse."),
         'get_incoming_moves', setter='set_incoming_moves')
     inventory_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Inventory Moves',
@@ -1430,13 +1463,15 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
                     Eval('warehouse_input') == Eval('warehouse_storage')),
                 },
             depends=['state', 'warehouse', 'warehouse_input',
-                'warehouse_storage', 'warehouse_input', 'company']),
+                'warehouse_storage', 'warehouse_input', 'company'],
+            help="The moves that put the stock away into the storage area."),
         'get_inventory_moves', setter='set_inventory_moves')
     moves = fields.One2Many('stock.move', 'shipment', 'Moves',
         domain=[('company', '=', Eval('company'))], depends=['company'],
         readonly=True)
     origins = fields.Function(fields.Char('Origins'), 'get_origins')
-    number = fields.Char('Number', size=None, select=True, readonly=True)
+    number = fields.Char('Number', size=None, select=True, readonly=True,
+        help="The main identifier for the shipment.")
     received_by = employee_field("Received By")
     done_by = employee_field("Done By")
     state = fields.Selection([
@@ -1444,16 +1479,13 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         ('done', 'Done'),
         ('cancel', 'Canceled'),
         ('received', 'Received'),
-        ], 'State', readonly=True)
+        ], 'State', readonly=True,
+        help="The current state of the shipment.")
 
     @classmethod
     def __setup__(cls):
         super(ShipmentOutReturn, cls).__setup__()
         cls._order[0] = ('id', 'DESC')
-        cls._error_messages.update({
-                'delete_cancel': ('Customer Return Shipment "%s" must be '
-                    'cancelled before deletion.'),
-                })
         cls._transitions |= set((
                 ('draft', 'received'),
                 ('received', 'done'),
@@ -1645,7 +1677,9 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         cls.cancel(shipments)
         for shipment in shipments:
             if shipment.state != 'cancel':
-                cls.raise_user_error('delete_cancel', shipment.rec_name)
+                raise AccessError(
+                    gettext('stock.msg_shipment_delete_cancel',
+                        shipment=shipment.rec_name))
         Move.delete([m for s in shipments for m in s.moves])
         super(ShipmentOutReturn, cls).delete(shipments)
 
@@ -1695,8 +1729,8 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         Move.cancel([m for s in shipments
                 for m in s.incoming_moves + s.inventory_moves])
 
-    @staticmethod
-    def _get_inventory_moves(incoming_move):
+    def _get_inventory_move(self, incoming_move):
+        'Return inventory move for the incoming move'
         pool = Pool()
         Move = pool.get('stock.move')
         if incoming_move.quantity <= 0.0:
@@ -1706,7 +1740,7 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
         move.uom = incoming_move.uom
         move.quantity = incoming_move.quantity
         move.from_location = incoming_move.to_location
-        move.to_location = incoming_move.shipment.warehouse_storage
+        move.to_location = self.warehouse_storage
         move.state = Move.default_state()
         # Product will be considered in stock only when the inventory
         # move will be made:
@@ -1725,7 +1759,7 @@ class ShipmentOutReturn(Workflow, ModelSQL, ModelView):
             # moves, it will reset also the incoming_moves
             moves = list(shipment.moves)
             for incoming_move in shipment.incoming_moves:
-                move = cls._get_inventory_moves(incoming_move)
+                move = shipment._get_inventory_move(incoming_move)
                 if move:
                     moves.append(move)
             shipment.moves = moves
@@ -1736,7 +1770,8 @@ class AssignShipmentOutAssignFailed(ModelView):
     'Assign Customer Shipment'
     __name__ = 'stock.shipment.out.assign.failed'
     inventory_moves = fields.Many2Many('stock.move', None, None,
-        'Inventory Moves', readonly=True)
+        'Inventory Moves', readonly=True,
+        help="The inventory moves that were not assigned.")
 
     @staticmethod
     def default_inventory_moves():
@@ -1788,22 +1823,26 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
         states={
             'readonly': Eval('state').in_(['cancel', 'done']),
             },
-        depends=['state'])
+        depends=['state'],
+        help="When the shipment was actually completed.")
     planned_date = fields.Date('Planned Date',
         states={
             'readonly': ~Eval('state').in_(['request', 'draft']),
-            }, depends=['state'])
+            }, depends=['state'],
+        help="When the shipment is expected to be completed.")
     effective_start_date = fields.Date('Effective Start Date',
         states={
             'readonly': Eval('state').in_(['cancel', 'shipped', 'done']),
             },
-        depends=['state'])
+        depends=['state'],
+        help="When the stock was actually sent.")
     planned_start_date = fields.Date('Planned Start Date',
         states={
             'readonly': ~Eval('state').in_(['request', 'draft']),
             'required': Bool(Eval('planned_date')),
             },
-        depends=['state'])
+        depends=['state'],
+        help="When the stock is expected to be sent.")
     company = fields.Many2One('company.company', 'Company', required=True,
         states={
             'readonly': ~Eval('state').in_(['request', 'draft']),
@@ -1812,12 +1851,15 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
             ('id', If(Eval('context', {}).contains('company'), '=', '!='),
                 Eval('context', {}).get('company', -1)),
             ],
-        depends=['state'])
-    number = fields.Char('Number', size=None, select=True, readonly=True)
+        depends=['state'],
+        help="The company the shipment is associated with.")
+    number = fields.Char('Number', size=None, select=True, readonly=True,
+        help="The main identifier for the shipment.")
     reference = fields.Char("Reference", size=None, select=True,
         states={
             'readonly': ~Eval('state').in_(['request', 'draft']),
-            }, depends=['state'])
+            }, depends=['state'],
+        help="The external identifiers for the shipment.")
     from_location = fields.Many2One('stock.location', "From Location",
         required=True, states={
             'readonly': (~Eval('state').in_(['request', 'draft'])
@@ -1825,16 +1867,21 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
             },
         domain=[
             ('type', 'in', ['view', 'storage', 'lost_found']),
-            ], depends=['state'])
+            ], depends=['state'],
+        help="Where the stock is moved from.")
     to_location = fields.Many2One('stock.location', "To Location",
         required=True, states={
             'readonly': (~Eval('state').in_(['request', 'draft'])
                     | Eval('moves', [0])),
             }, domain=[
             ('type', 'in', ['view', 'storage', 'lost_found']),
-            ], depends=['state'])
+            ], depends=['state'],
+        help="Where the stock is moved to.")
     transit_location = fields.Function(fields.Many2One('stock.location',
-            'Transit Location'), 'on_change_with_transit_location')
+            'Transit Location',
+            help="Where the stock is located while it is in transit between "
+            "the warehouses."),
+        'on_change_with_transit_location')
     moves = fields.One2Many('stock.move', 'shipment', 'Moves',
         states={
             'readonly': (Eval('state').in_(['cancel', 'assigned', 'done'])
@@ -1872,7 +1919,8 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
             ('company', '=', Eval('company')),
             ],
         depends=['state', 'from_location', 'to_location', 'transit_location',
-            'company'])
+            'company'],
+        help="The moves that perform the shipment.")
     outgoing_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Outgoing Moves',
             domain=[
@@ -1893,7 +1941,8 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
                     | Eval('state').in_(['request', 'draft'])),
                 },
             depends=['from_location', 'to_location', 'transit_location',
-                'state']),
+                'state'],
+            help="The moves that send the stock out."),
         'get_outgoing_moves', setter='set_moves')
     incoming_moves = fields.Function(fields.One2Many('stock.move', 'shipment',
             'Incoming Moves',
@@ -1914,7 +1963,8 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
                     | Eval('state').in_(['request', 'draft'])),
                 },
             depends=['from_location', 'to_location', 'transit_location',
-                'state']),
+                'state'],
+            help="The moves that receive the stock in."),
         'get_incoming_moves', setter='set_moves')
     assigned_by = employee_field("Received By")
     shipped_by = employee_field("Shipped By")
@@ -1927,16 +1977,13 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
             ('assigned', 'Assigned'),
             ('shipped', 'Shipped'),
             ('done', 'Done'),
-            ], 'State', readonly=True)
+            ], 'State', readonly=True,
+        help="The current state of the shipment.")
 
     @classmethod
     def __setup__(cls):
         super(ShipmentInternal, cls).__setup__()
         cls._order[0] = ('id', 'DESC')
-        cls._error_messages.update({
-                'delete_cancel': ('Internal Shipment "%s" must be cancelled '
-                    'before deletion.'),
-                })
         cls._transitions |= set((
                 ('request', 'draft'),
                 ('draft', 'waiting'),
@@ -2105,7 +2152,9 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
         cls.cancel(shipments)
         for shipment in shipments:
             if shipment.state != 'cancel':
-                cls.raise_user_error('delete_cancel', shipment.rec_name)
+                raise AccessError(
+                    gettext('stock.msg_shipment_delete_cancel',
+                        shipment=shipment.rec_name))
         Move.delete([m for s in shipments for m in s.moves])
         super(ShipmentInternal, cls).delete(shipments)
 
@@ -2151,7 +2200,7 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
         for shipment in shipments:
             if not shipment.transit_location:
                 continue
-            product_qty = defaultdict(lambda: 0)
+            product_qty = defaultdict(int)
             for move in shipment.outgoing_moves:
                 if move.state == 'cancel':
                     continue
@@ -2311,14 +2360,16 @@ class ShipmentInternal(Workflow, ModelSQL, ModelView):
 
 class Address(metaclass=PoolMeta):
     __name__ = 'party.address'
-    delivery = fields.Boolean('Delivery')
+    delivery = fields.Boolean('Delivery',
+        help="Check to send deliveries to the address.")
 
 
 class AssignShipmentInternalAssignFailed(ModelView):
     'Assign Shipment Internal'
     __name__ = 'stock.shipment.internal.assign.failed'
     moves = fields.Many2Many('stock.move', None, None, 'Moves',
-        readonly=True)
+        readonly=True,
+        help="The moves that were not assigned.")
 
     @staticmethod
     def default_moves():
@@ -2366,7 +2417,8 @@ class AssignShipmentInReturnAssignFailed(ModelView):
     'Assign Supplier Return Shipment'
     __name__ = 'stock.shipment.in.return.assign.failed'
     moves = fields.Many2Many('stock.move', None, None, 'Moves',
-            readonly=True)
+            readonly=True,
+            help="The moves that were not assigned.")
 
     @staticmethod
     def default_moves():
@@ -2421,7 +2473,6 @@ class DeliveryNote(CompanyReport):
 
 
 class ShipmentReport(CompanyReport):
-    move_attribute = 'inventory_moves'
 
     @classmethod
     def execute(cls, ids, data):
@@ -2429,25 +2480,29 @@ class ShipmentReport(CompanyReport):
             return super(ShipmentReport, cls).execute(ids, data)
 
     @classmethod
-    def get_context(cls, records, data):
-        report_context = super(ShipmentReport, cls).get_context(records, data)
+    def moves(cls, shipment):
+        raise NotImplementedError
 
-        compare_context = cls.get_compare_context(records, data)
+    @classmethod
+    def get_context(cls, shipments, data):
+        report_context = super().get_context(shipments, data)
+
+        compare_context = cls.get_compare_context(shipments, data)
         sorted_moves = {}
-        for shipment in records:
+        for shipment in shipments:
             sorted_moves[shipment.id] = sorted(
-                getattr(shipment, cls.move_attribute),
+                cls.moves(shipment),
                 key=functools.partial(cls.get_compare_key, compare_context))
         report_context['moves'] = sorted_moves
 
         return report_context
 
     @classmethod
-    def get_compare_context(cls, objects, data):
+    def get_compare_context(cls, shipments, data):
         from_location_ids = set()
         to_location_ids = set()
-        for obj in objects:
-            for move in getattr(obj, cls.move_attribute):
+        for shipment in shipments:
+            for move in cls.moves(shipment):
                 from_location_ids.add(move.from_location.id)
                 to_location_ids.add(move.to_location.id)
 
@@ -2468,18 +2523,48 @@ class PickingList(ShipmentReport):
     'Picking List'
     __name__ = 'stock.shipment.out.picking_list'
 
+    @classmethod
+    def moves(cls, shipment):
+        if shipment.warehouse_storage == shipment.warehouse_output:
+            return shipment.outgoing_moves
+        else:
+            return shipment.inventory_moves
+
 
 class SupplierRestockingList(ShipmentReport):
     'Supplier Restocking List'
     __name__ = 'stock.shipment.in.restocking_list'
+
+    @classmethod
+    def moves(cls, shipment):
+        if shipment.warehouse_input == shipment.warehouse_storage:
+            return shipment.incoming_moves
+        else:
+            return shipment.inventory_moves
 
 
 class CustomerReturnRestockingList(ShipmentReport):
     'Customer Return Restocking List'
     __name__ = 'stock.shipment.out.return.restocking_list'
 
+    @classmethod
+    def moves(cls, shipment):
+        if shipment.warehouse_input == shipment.warehouse_storage:
+            return shipment.incoming_moves
+        else:
+            return shipment.inventory_moves
+
 
 class InteralShipmentReport(ShipmentReport):
     'Interal Shipment Report'
     __name__ = 'stock.shipment.internal.report'
-    move_attribute = 'moves'
+
+    @classmethod
+    def moves(cls, shipment):
+        if shipment.transit_location:
+            if shipment.state == 'shipped':
+                return shipment.incoming_moves
+            else:
+                return shipment.outgoing_moves
+        else:
+            return shipment.moves
