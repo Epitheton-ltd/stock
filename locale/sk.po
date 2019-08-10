@@ -604,7 +604,7 @@ msgstr "Typ polohy"
 
 msgctxt "field:stock.location,warehouse:"
 msgid "Warehouse"
-msgstr "Veľkoobchod"
+msgstr "Veľkosklad"
 
 msgctxt "field:stock.location,write_date:"
 msgid "Write Date"
@@ -644,7 +644,7 @@ msgstr "Z veľkoobchodu"
 
 msgctxt "field:stock.location.lead_time,warehouse_to:"
 msgid "Warehouse To"
-msgstr "Do Veľkoobchodu"
+msgstr "Do Veľkoskladu"
 
 msgctxt "field:stock.location.lead_time,write_date:"
 msgid "Write Date"
@@ -872,7 +872,7 @@ msgstr ""
 
 msgctxt "field:stock.product_quantities_warehouse.context,warehouse:"
 msgid "Warehouse"
-msgstr "Veľkoobchod"
+msgstr "Veľkosklad"
 
 msgctxt "field:stock.products_by_locations.context,forecast_date:"
 msgid "At Date"
@@ -964,11 +964,11 @@ msgstr "Poloha dodávateľa"
 
 msgctxt "field:stock.shipment.in,warehouse:"
 msgid "Warehouse"
-msgstr "Veľkoobchod"
+msgstr "Veľkosklad"
 
 msgctxt "field:stock.shipment.in,warehouse_input:"
 msgid "Warehouse Input"
-msgstr "Vstupný Veľkoobchod"
+msgstr "Vstupný Veľkosklad"
 
 msgctxt "field:stock.shipment.in,warehouse_storage:"
 msgid "Warehouse Storage"
@@ -1493,7 +1493,7 @@ msgstr "Customer Return Shipments"
 
 msgctxt "model:ir.action,name:act_stock_configuration_form"
 msgid "Stock Configuration"
-msgstr "Stock Configuration"
+msgstr "Konfigurácia skladu"
 
 msgctxt "model:ir.action,name:report_shipment_in_restocking_list"
 msgid "Restocking List"
@@ -1958,7 +1958,7 @@ msgstr ""
 
 msgctxt "model:stock.inventory,name:"
 msgid "Stock Inventory"
-msgstr ""
+msgstr "Inventár skladu"
 
 msgctxt "model:stock.inventory.count.quantity,name:"
 msgid "Stock Inventory Count"
@@ -1970,7 +1970,7 @@ msgstr ""
 
 msgctxt "model:stock.inventory.line,name:"
 msgid "Stock Inventory Line"
-msgstr ""
+msgstr "Riadok inventára skladu"
 
 msgctxt "model:stock.location,name:"
 msgid "Stock Location"
@@ -2299,7 +2299,7 @@ msgstr "Dodávka"
 
 msgctxt "report:stock.shipment.out.return.restocking_list:"
 msgid "To Location"
-msgstr ""
+msgstr "Na miesto"
 
 msgctxt "report:stock.shipment.out.return.restocking_list:"
 msgid "Warehouse:"
